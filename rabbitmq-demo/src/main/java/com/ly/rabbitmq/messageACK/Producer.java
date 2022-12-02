@@ -25,6 +25,9 @@ public class Producer {
     public static void main(String[] args) throws IOException, TimeoutException {
         Channel channel = RabbitMQUtils.getNewChannel();
 
+        //开启发布确认功能
+//        channel.confirmSelect();
+
         System.out.println("生产者 [producer]开始生产大量的消息！");
 
         //设置队列持久化

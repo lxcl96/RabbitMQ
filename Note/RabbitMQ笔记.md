@@ -693,13 +693,47 @@ channel.basicConsume(..)
 
 ## 3. Publish/Subcribe
 
+
+
 ## 4. Routing
 
 ## 5.Topics
 
-## 6. Publisher Confirms
+## 6. Publisher Confirms（针对生产者）
 
+## 6.0 前提
 
+发布确认功能是为了将消息完全报错，所以开启发布确认前必须：
+
++ 开启队列持久化
++ 开启消息持久化
+
+### 6.1 发布确认原理
+
+​	生产者将信道设置成 confirm 模式，一旦信道进入 confirm 模式，**所有在该信道上面发布的消 息都将会被指派一个唯一的 ID(从 1 开始)**，一旦消息被投递到所有匹配的队列之后，**broker 就会 发送一个确认给生产者**(包含消息的唯一 ID)，这就使得生产者知道消息已经正确到达目的队列了， 如果消息和队列是可持久化的，那么确认消息会在将消息写入磁盘之后发出，broker 回传给生产 者的确认消息中 delivery-tag 域包含了确认消息的序列号，此外 broker 也可以设置basic.ack 的 multiple 域，表示到这个序列号之前的所有消息都已经得到了处理。
+
+​	confirm 模式最大的好处在于他是异步的，一旦发布一条消息，生产者应用程序就可以在等信道 返回确认的同时继续发送下一条消息，当消息最终得到确认之后，生产者应用便可以通过回调方 法来处理该确认消息，如果 RabbitMQ 因为自身内部错误导致消息丢失，就会发送一条 nack 消息， 生产者应用程序同样可以在回调方法中处理该 nack 消息。
+
+### 6.2 开启发布确认
+
+```java
+Channel channel = RabbitMQUtils.getNewChannel();
+
+//开启发布确认功能
+channel.confirmSelect();
+
+//发布消息完等待rabbitmqm确认
+channel.basicPublish("",QUEUE,MessageProperties.PERSISTENT_TEXT_PLAIN,( "").getBytes());
+boolean tag = channel.waitForConfirms();
+```
+
+### 6.2 发布确认策略
+
+#### 6.2.1 单个确认发布
+
+#### 6.2.2 批量确认发布
+
+#### 6.2.3 异步确认发布
 
 # 第三章 高级部分*
 
