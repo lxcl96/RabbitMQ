@@ -729,11 +729,205 @@ boolean tag = channel.waitForConfirms();
 
 ### 6.2 发布确认策略
 
-#### 6.2.1 单个确认发布
+#### 6.2.1 单个同步确认发布
 
-#### 6.2.2 批量确认发布
+​	这是一种简单的确认方式，它是一种**同步确认发布**的方式，也就是发布一个消息之后只有它被确认发布，后续的消息才能继续发布,`waitForConfirmsOrDie(long)`这个方法只有在消息被确认的时候才返回，如果在指定时间范围内这个消息没有被确认那么它将抛出异常。
 
-#### 6.2.3 异步确认发布
+​	这种确认方式有一个**最大的缺点就是:发布速度特别的慢**，因为如果没有确认发布的消息就会阻塞所有后续消息的发布，这种方式最多提供每秒不超过数百条发布消息的吞吐量。当然对于某些应用程序来说这可能已经足够了。
+
+```java
+/**
+ * 单个消息同步发布确认
+ */
+public static void singleConfirm() throws IOException, TimeoutException, InterruptedException {
+    String QUEUE = UUID.randomUUID().toString();
+    Channel channel = RabbitMQUtils.getNewChannel();
+    //【核心代码1】
+    channel.confirmSelect();
+
+    //创建队列
+    channel.queueDeclare(QUEUE, true, false, false, null);
+
+    long begin = System.currentTimeMillis();
+    //发送消息
+    for (int i = 0; i < MESSAGE_MAX_COUNT; i++) {
+        channel.basicPublish("",QUEUE,MessageProperties.PERSISTENT_TEXT_PLAIN,(i + "").getBytes());
+        //单个消息确认 【核心代码2】
+        boolean tag = channel.waitForConfirms();
+        if (!tag) {
+            System.out.println("【单个消息发布确认】 第" + i + " 失败！");
+        }
+    }
+    long end = System.currentTimeMillis();
+    System.out.println("1000个消息，【单个消息发布确认】 完成时间：" + (end - begin) + "ms");
+}
+```
+
+#### 6.2.2 批量同步确认发布
+
+​	上面那种方式非常慢，与单个等待确认消息相比，先发布一批消息然后一起确认可以极大地 **提高吞吐量**，当然这种方式的**缺点就是:当发生故障导致发布出现问题时，不知道是哪个消息出现 问题了，我们必须将整个批处理保存在内存中，以记录重要的信息而后重新发布消息**。当然这种 方案仍然是同步的，也一样阻塞消息的发布。
+
+```java
+/**
+ * 批量同步消息发布确认
+ */
+public static void batchConfirm() throws IOException, TimeoutException, InterruptedException {
+    String QUEUE = UUID.randomUUID().toString();
+    Channel channel = RabbitMQUtils.getNewChannel();
+    //【核心代码1】
+    channel.confirmSelect();
+
+    //创建队列
+    channel.queueDeclare(QUEUE, true, false, false, null);
+
+    long begin = System.currentTimeMillis();
+    //发送消息
+    for (int i = 0; i < MESSAGE_MAX_COUNT; i++) {
+        channel.basicPublish("",QUEUE,MessageProperties.PERSISTENT_TEXT_PLAIN,(i + "").getBytes());
+    }
+    //1000条确认一次 【核心代码2】
+    boolean tag = channel.waitForConfirms();
+    if (!tag) {
+        System.out.println("【批量消息发布确认】 有 失败的！");
+    }
+    long end = System.currentTimeMillis();
+    System.out.println("1000个消息，【批量消息发布确认】 完成时间：" + (end - begin) + "ms");
+}
+```
+
+#### 6.2.3 异步确认发布*
+
+​	异步确认虽然编程逻辑比上两个要复杂，但是性价比最高，无论是可靠性还是效率都没得说， 他是利用回调函数来达到消息可靠性传递的，这个中间件也是通过函数回调来保证是否投递成功， 下面就让我们来详细讲解异步确认是怎么实现的。
+
+<img src='img\image-20221204180129815.png'>
+
+```java
+/**
+     * 异步消息确认
+     */
+public static void asyncConfirm() throws IOException, TimeoutException {
+    String QUEUE = UUID.randomUUID().toString();
+    Channel channel = RabbitMQUtils.getNewChannel();
+    channel.confirmSelect();
+
+    //创建队列
+    channel.queueDeclare(QUEUE, true, false, false, null);
+
+    // 准备一个线程安全的哈希表ConcurrentSkipListMap，用于存储所有的发送消息
+    //1.ConcurrentSkipListMap可以轻松的将序号与消息进行关联
+    //2.轻松批量删除条目，只要有序号
+    //3.支持高并发（多线程）
+    ConcurrentSkipListMap<Long, String> map = new ConcurrentSkipListMap<>();
+
+    long begin = System.currentTimeMillis();
+
+    /**
+         * 因为消息发成功还是失败，是由mq服务器主动告诉生产者的，所以需要一个监听器来监听来自server的异步通知
+         *    监听器分两种：
+         *      只监听成功的
+         *     void addConfirmListener(ConfirmListener listener);
+         *      即监听成功的，也监听失败的
+         *     ConfirmListener addConfirmListener(ConfirmCallback ackCallback, ConfirmCallback nackCallback);
+         */
+    channel.addConfirmListener(
+        new ConfirmCallback() {
+            @Override
+            public void handle(long deliveryTag, boolean multiple) throws IOException {
+                //监听成功的
+                System.out.println(deliveryTag);
+                //删除成功发布的消息(因为有可能是批量确认的，所有不止一条消息)
+                if (multiple) {
+                    ConcurrentNavigableMap<Long, String> headMap = map.headMap(deliveryTag);
+                    headMap.clear();
+                } else {
+                    //System.out.println(deliveryTag + ":" + map.get(deliveryTag));
+                    map.remove(deliveryTag);
+                }
+
+            }
+        },
+        new ConfirmCallback() {
+            @Override
+            public void handle(long deliveryTag, boolean multiple) throws IOException {
+                //监听失败的
+                System.out.println("异步确认失败的deliveryTag=" + deliveryTag);
+            }
+        }
+    );
+
+    //发送消息
+    for (int i = 0; i < MESSAGE_MAX_COUNT; i++) {
+
+        /**
+         * 如何处理异步未确认的消息？
+         *  答：最好的解决方法就是把未确认的消息放在一个基于内存的能被发布线程（生产者）访问的队列中，如CurrentLinkedQueue，这个队列在 confirm callbacks 与发布线程（生产者进行消息的传递）
+         * 怎么实现？
+         *  答：
+         *      1、发布消息时将消息放在线程安全的 CurrentLinkedQueue 队列中
+         *      2、rabbitmq服务器在进行异步 正确的回调函数时 将CurrentLinkedQueue以及确认的消息删掉，那么剩下的就是未确认的
+         *      3、rabbitmq在确认发布失败，调用失败的回调函数 对失败的消息重新处理如：重新发布
+         */
+        map.put(channel.getNextPublishSeqNo(),i + "");//序号从1 开始（先存储不需要减1）
+		//此时发布消息的序号为1
+        channel.basicPublish("",QUEUE,MessageProperties.PERSISTENT_TEXT_PLAIN,(i + "").getBytes());
+        
+        //map.put(channel.getNextPublishSeqNo() - 1,i + "");//如果是发布之后获取下一个序号，则必须要减1
+
+    }
+    System.out.println(map);
+
+    long end = System.currentTimeMillis();
+    System.out.println("1000个消息，【异步消息发布确认】 完成时间：" + (end - begin) + "ms");
+}
+}
+```
+
+#### 6.2.4 如何处理异步未确认的消息？*
+
+​	最好的解决的解决方案就是把未确认的消息放到一个基于内存的能被发布线程访问的队列， 比如说用 ConcurrentLinkedQueue 这个队列在 confirm callbacks 与发布线程之间进行消息的传 递。
+
++ 发布消息时将消息放在线程安全的 CurrentLinkedQueue 队列中
++ rabbitmq服务器在进行异步 正确的回调函数时 将CurrentLinkedQueue以及确认的消息删掉，那么剩下的就是未确认的
++ rabbitmq在确认发布失败，调用失败的回调函数 对失败的消息重新处理如：重新发布
+
+***部分代码（详细见异步确认模块 ↑）：***
+
+```java
+// 准备一个线程安全的哈希表ConcurrentSkipListMap，用于存储所有的发送消息
+//1.ConcurrentSkipListMap可以轻松的将序号与消息进行关联
+//2.轻松批量删除条目，只要有序号
+//3.支持高并发（多线程）
+ConcurrentSkipListMap<Long, String> map = new ConcurrentSkipListMap<>();
+...
+    
+ channel.addConfirmListener(
+    new ConfirmCallback() {
+        @Override
+        public void handle(long deliveryTag, boolean multiple) throws IOException {
+            //监听成功的
+            System.out.println(deliveryTag);
+            //删除成功发布的消息(因为有可能是批量确认的，所有不止一条消息)
+            if (multiple) {
+                //异步批量确认的
+                ConcurrentNavigableMap<Long, String> headMap = map.headMap(deliveryTag);
+                headMap.clear();
+            } else {
+                //System.out.println(deliveryTag + ":" + map.get(deliveryTag));
+                map.remove(deliveryTag);
+            }
+
+        }
+    },
+    new ConfirmCallback() {
+        @Override
+        public void handle(long deliveryTag, boolean multiple) throws IOException {
+            //监听失败的
+            System.out.println("异步确认失败的deliveryTag=" + deliveryTag);
+            // 失败的处理逻辑，如重新发布
+        }
+    }
+);
+```
 
 # 第三章 高级部分*
 

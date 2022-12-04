@@ -14,7 +14,7 @@ import java.util.concurrent.TimeoutException;
  * Description: rabbitmq简单的连接工厂
  */
 public class RabbitMQUtils {
-    private static final String host = "192.168.77.3";
+    private static final String host = "192.168.65.229";
     private static final String username = "ly";
     private static final String passwd = "1024";
     //测试队列名

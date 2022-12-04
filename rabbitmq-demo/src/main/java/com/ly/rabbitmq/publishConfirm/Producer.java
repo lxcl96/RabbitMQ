@@ -7,6 +7,9 @@ import com.rabbitmq.client.MessageProperties;
 
 import java.io.IOException;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ConcurrentNavigableMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeoutException;
 
 /**
@@ -40,13 +43,7 @@ public class Producer {
         channel.confirmSelect();
 
         //创建队列
-        channel.queueDeclare(
-                QUEUE,
-                true,
-                false,
-                false,
-                null
-        );
+        channel.queueDeclare(QUEUE, true, false, false, null);
 
         long begin = System.currentTimeMillis();
         //发送消息
@@ -70,13 +67,7 @@ public class Producer {
         channel.confirmSelect();
 
         //创建队列
-        channel.queueDeclare(
-                QUEUE,
-                true,
-                false,
-                false,
-                null
-        );
+        channel.queueDeclare(QUEUE, true, false, false, null);
 
         long begin = System.currentTimeMillis();
         //发送消息
@@ -101,13 +92,13 @@ public class Producer {
         channel.confirmSelect();
 
         //创建队列
-        channel.queueDeclare(
-                QUEUE,
-                true,
-                false,
-                false,
-                null
-        );
+        channel.queueDeclare(QUEUE, true, false, false, null);
+
+        // 准备一个线程安全的哈希表ConcurrentSkipListMap，用于存储所有的发送消息
+        //1.ConcurrentSkipListMap可以轻松的将序号与消息进行关联
+        //2.轻松批量删除条目，只要有序号
+        //3.支持高并发（多线程）
+        ConcurrentSkipListMap<Long, String> map = new ConcurrentSkipListMap<>();
 
         long begin = System.currentTimeMillis();
 
@@ -125,6 +116,15 @@ public class Producer {
                     public void handle(long deliveryTag, boolean multiple) throws IOException {
                         //监听成功的
                         System.out.println(deliveryTag);
+                        //删除成功发布的消息(因为有可能是批量确认的，所有不止一条消息)
+                        if (multiple) {
+                            ConcurrentNavigableMap<Long, String> headMap = map.headMap(deliveryTag);
+                            headMap.clear();
+                        } else {
+                            //System.out.println(deliveryTag + ":" + map.get(deliveryTag));
+                            map.remove(deliveryTag);
+                        }
+
                     }
                 },
                 new ConfirmCallback() {
@@ -144,9 +144,28 @@ public class Producer {
 
         //发送消息
         for (int i = 0; i < MESSAGE_MAX_COUNT; i++) {
-            channel.basicPublish("",QUEUE,MessageProperties.PERSISTENT_TEXT_PLAIN,(i + "").getBytes());
+
+            /**
+             * 如何处理异步未确认的消息？
+             *  答：最好的解决方法就是把未确认的消息放在一个基于内存的能被发布线程（生产者）访问的队列中，如CurrentLinkedQueue，
+             *      这个队列在 confirm callbacks 与发布线程（生产者进行消息的传递）
+             * 怎么实现？
+             *  答：
+             *      1、发布消息时将消息放在线程安全的 CurrentLinkedQueue 队列中
+             *      2、rabbitmq服务器在进行异步 正确的回调函数时 将CurrentLinkedQueue以及确认的消息删掉，那么剩下的就是未确认的
+             *      3、rabbitmq在确认发布失败，调用失败的回调函数 对失败的消息重新处理如：重新发布
+             *
+             *  注意 channel.getNextPublishSeqNo() 每发布消息basicPublish调用一次，都会+1，所以注意put存放时序号的前后位置和要不要-1
+             */
+            map.put(channel.getNextPublishSeqNo(),i + "");//序号从1 开始
+
+            channel.basicPublish("",QUEUE,MessageProperties.PERSISTENT_TEXT_PLAIN,(i + "").getBytes());//此时发布消息的序号为1
+            System.out.println(channel.getNextPublishSeqNo());//2
+            //System.exit(0);
+            //map.put(channel.getNextPublishSeqNo() - 1,i + "");
 
         }
+        System.out.println(map);
 
         long end = System.currentTimeMillis();
         System.out.println("1000个消息，【异步消息发布确认】 完成时间：" + (end - begin) + "ms");
