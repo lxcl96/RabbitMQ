@@ -118,6 +118,7 @@ public class Producer {
                         System.out.println(deliveryTag);
                         //删除成功发布的消息(因为有可能是批量确认的，所有不止一条消息)
                         if (multiple) {
+                            //如果是批量处理，tag小于deliveryTag的均已经被确认了
                             ConcurrentNavigableMap<Long, String> headMap = map.headMap(deliveryTag);
                             headMap.clear();
                         } else {
