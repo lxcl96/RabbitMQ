@@ -1282,7 +1282,336 @@ ConcurrentSkipListMap<Long, String> map = new ConcurrentSkipListMap<>();
 
 # 第三章 高级部分*
 
-## 1. 死信队列
+## 0. ==***queueDeclare 队列的11个可选参数***==\*
+
+通过代码，创建队列；或者直接在web页面创建队列11个可选参数
+
+```java
+channel.queueDeclare(DEAD_QUEUE_NAME,false,false,false,map);//map参数集合
+```
+
+<img src='img\image-20221206110629137.png'>
+
+```java
+/*
+（1）x-message-ttl：消息的过期时间，单位：毫秒；【队列中所有消息】
+（2）x-expires：队列过期时间，队列在多长时间未被访问将被删除，单位：毫秒； 【指队列】
+（3）x-max-length：队列最大长度，超过该最大值，则将从队列头部开始删除消息；
+（4）x-max-length-bytes：队列消息内容占用最大空间，受限于内存大小，超过该阈值则从队列头部开始删除消息；
+（5）x-overflow：设置队列溢出行为。这决定了当达到队列的最大长度时消息会发生什么。有效值是drop-head、reject-publish或reject-publish-dlx。仲裁队列类型仅支持drop-head；
+（6）x-dead-letter-exchange：死信交换器名称，过期或被删除（因队列长度超长或因空间超出阈值）的消息可指定发送到该交换器中；
+（7）x-dead-letter-routing-key：死信消息路由键，在消息发送到死信交换器时会使用该路由键，如果不设置，则使用消息的原来的路由键值
+（8）x-single-active-consumer：表示队列是否是单一活动消费者，true时，注册的消费组内只有一个消费者消费消息，其他被忽略，false时消息循环分发给所有消费者(默认false)
+（9）x-max-priority：队列要支持的最大优先级数;如果未设置，队列将不支持消息优先级；
+（10）x-queue-mode（Lazy mode）：将队列设置为延迟模式，在磁盘上保留尽可能多的消息，以减少RAM的使用;如果未设置，队列将保留内存缓存以尽可能快地传递消息；
+（11）x-queue-master-locator：在集群模式下设置镜像队列的主节点信息。
+
+*/
+```
+
+
+
+## 1. 死信队列*
+
+### 1.1 概念
+
+​	先从概念解释上搞清楚这个定义，死信，顾名思义就是无法被消费的消息，字面意思可以这样理 解，一般来说，producer 将消息投递到 broker 或者直接到queue 里了，consumer 从 queue 取出消息 进行消费，但某些时候**由于特定的原因导致 queue 中的某些消息无法被消费**，这样的消息如果没有 后续的处理，就变成了死信，有死信自然就有了死信队列。
+
+​	应用场景:为了保证订单业务的消息数据不丢失，需要使用到 RabbitMQ 的死信队列机制，当消息 消费发生异常时，将消息投入死信队列中.还有比如说: 用户在商城下单成功并点击去支付后在指定时 间未支付时自动失效。
+
+### 1.2 死信队列消息的三大来源
+
++ ==*消息超时未被消费*==
+
++ ==*消息超过队列可接收的最大长度*==
+
+  > 注意：**最先到达的消息会被挤出去，而不是最后面的被挤出去。【队列先进先出原则】**
+
++ ==*消息被拒绝且不重新入队*==
+
+  > 注意：**消费者，必须关闭自动应答**
+
+### 1.3 代码演示
+
+#### I. 目标
+
+<img src='img\image-20221206104518379.png'>
+
+#### II. ==*消息超时未被消费*==
+
+***生产者代码：***
+
+```java
+public class Producer {
+    private static final String NORMAL_QUEUE_NAME = "normal_queue";
+    private static final String NORMAL_EXCHANGE_NAME = "normal_exchange";
+
+    public static void main(String[] args) throws Exception {
+        Channel channel = RabbitMQUtils.getNewChannel();
+
+        //1. 发送过时消息[死信队列]
+        channel.basicPublish(
+                NORMAL_EXCHANGE_NAME,
+                "zhangsan",
+                //设置消息的属性 如路由头，持久化，过期时间等等
+                new AMQP.BasicProperties().builder().expiration("10000").priority(0).build(),//过期时间单位毫秒,优先级为0
+                "hello dead-letter".getBytes(StandardCharsets.UTF_8)
+        );
+       
+    }
+}
+```
+
+***正常消费者代码：***
+
+```java
+public class Consumer_1 {
+    private static final String NORMAL_EXCHANGE_NAME = "normal_exchange";
+    private static final String DEAD_EXCHANGE_NAME = "dead_exchange";
+    private static final String NORMAL_QUEUE_NAME = "normal_queue";
+    private static final String DEAD_QUEUE_NAME = "dead_queue";
+
+    public static void main(String[] args) throws IOException, TimeoutException {
+
+        //通过参数设置死信格式（通过队列的构造函数方式）
+        Map<String, Object> map = new HashMap<>();
+        /**
+         * 所有可以设置的11个参数参数  见0. queueDeclare的11个可选参数
+         */
+        map.put("x-dead-letter-exchange",DEAD_EXCHANGE_NAME);//指明要转发到的指定死信交换机
+        map.put("x-dead-letter-routing-key","lisi");//指明要转发到的指定死信交换机的routingKey
+        //过期时间：1、生产者指定单个消息过期时间 2、设置队列中所有消息的过期时间
+        //map.put("x-message-ttl",10000);//单位毫秒 10s 属于设置队列中所有消息的属性，不推荐；因为每个消息的过期时间应该不一样（所以应该由生产者发送消息时指定过期时间时间）
+
+        Channel channel = RabbitMQUtils.getNewChannel();
+
+        //普通交换机和队列
+        channel.exchangeDeclare(NORMAL_EXCHANGE_NAME, BuiltinExchangeType.DIRECT);
+        channel.queueDeclare(NORMAL_QUEUE_NAME,false,false,false,map);
+        channel.queueBind(NORMAL_QUEUE_NAME,NORMAL_EXCHANGE_NAME,"zhangsan");
+        //创建死信队列
+        channel.exchangeDeclare(DEAD_EXCHANGE_NAME, BuiltinExchangeType.DIRECT);
+        channel.queueDeclare(DEAD_QUEUE_NAME,false,false,false,null);
+        channel.queueBind(DEAD_QUEUE_NAME,DEAD_EXCHANGE_NAME,"lisi");
+
+        channel.basicConsume(
+                NORMAL_QUEUE_NAME,
+                true,
+                //正常消费
+                (consumerTag, message) -> {
+                    String msg = new String(message.getBody(), StandardCharsets.UTF_8);
+                    System.out.println("收到的消息msg 【" + msg + "】");
+                    //判断为死信
+                    //1.消息过期 [生产者设置]
+                //取消消费
+                consumerTag -> {
+                    //
+                    System.out.println("c1 取消消费！");
+                }
+        );
+    }
+}
+```
+
+***死信消费者代码：***
+
+```java
+public class Consumer_2 {
+    private static final String DEAD_QUEUE_NAME = "dead_queue";
+
+    public static void main(String[] args) throws IOException, TimeoutException {
+        Channel channel = RabbitMQUtils.getNewChannel();
+        //可以不创建死信队列直接用，那么必须要求第一次运行时Consumer_1先运行
+        channel.basicConsume(
+                DEAD_QUEUE_NAME,
+                true,
+                (consumerTag, message) -> {
+                    System.out.println("成功接收到来自 [死信队列] 的消息：" + new String(message.getBody(), StandardCharsets.UTF_8));
+                },
+                //取消消息的回调
+                consumerTag -> {}
+        );
+
+    }
+
+}
+```
+
+***结果：***
+
+<img src='img\image-20221206105104945.png'>
+
+#### III. ==*消息超过队列可接收的最大长度*==
+
+***生产者代码：***
+
+```java
+public class Producer {
+    private static final String NORMAL_QUEUE_NAME = "normal_queue";
+    private static final String NORMAL_EXCHANGE_NAME = "normal_exchange";
+
+    public static void main(String[] args) throws Exception {
+        Channel channel = RabbitMQUtils.getNewChannel();
+
+        //2.超对队列保存消息的最大长度6[死信队列]
+        for (int i = 1; i < 11; i++) {
+            channel.basicPublish(
+                    NORMAL_EXCHANGE_NAME,
+                    "zhangsan",
+                    null,
+                    ("msg=" + i).getBytes(StandardCharsets.UTF_8)
+            );
+        }
+}
+```
+
+***正常消费者代码：***
+
+```java
+public class Consumer_1 {
+    private static final String NORMAL_EXCHANGE_NAME = "normal_exchange";
+    private static final String DEAD_EXCHANGE_NAME = "dead_exchange";
+    private static final String NORMAL_QUEUE_NAME = "normal_queue";
+    private static final String DEAD_QUEUE_NAME = "dead_queue";
+
+    public static void main(String[] args) throws IOException, TimeoutException {
+
+        //通过参数设置死信格式（通过队列的构造函数方式）
+        Map<String, Object> map = new HashMap<>();
+        /**
+         * 所有可以设置的参数 共11个见 0. queueDeclare所有参数解析
+         */
+        map.put("x-dead-letter-exchange",DEAD_EXCHANGE_NAME);//指明要转发到的指定死信交换机
+        map.put("x-dead-letter-routing-key","lisi");//指明要转发到的指定死信交换机的routingKey
+        map.put("x-max-length",6);//正常队列可以保存的最大长度信息，超过自动转入到死信
+
+        Channel channel = RabbitMQUtils.getNewChannel();
+
+        //普通交换机和队列
+        channel.exchangeDeclare(NORMAL_EXCHANGE_NAME, BuiltinExchangeType.DIRECT);
+        channel.queueDeclare(NORMAL_QUEUE_NAME,false,false,false,map);
+        channel.queueBind(NORMAL_QUEUE_NAME,NORMAL_EXCHANGE_NAME,"zhangsan");
+        //创建死信队列
+        channel.exchangeDeclare(DEAD_EXCHANGE_NAME, BuiltinExchangeType.DIRECT);
+        channel.queueDeclare(DEAD_QUEUE_NAME,false,false,false,null);
+        channel.queueBind(DEAD_QUEUE_NAME,DEAD_EXCHANGE_NAME,"lisi");
+
+        channel.basicConsume(
+                NORMAL_QUEUE_NAME,
+                true,
+                //正常消费
+                (consumerTag, message) -> {
+                    String msg = new String(message.getBody(), StandardCharsets.UTF_8);
+                    System.out.println("收到的消息msg 【" + msg + "】");
+                    //判断为死信
+                    //2. 队列达到最大长度 [6]
+                },
+                //取消消费
+                consumerTag -> {
+                    System.out.println("c1 取消消费！");
+                }
+        );
+    }
+}
+```
+
+***死信消费者代码：***
+
+和 上面情况代码完全一样
+
+***结果：(先进先出原则，包含死信)***
+
+<img src='img\image-20221206105713018.png'>
+
+#### IV. ==*消息被拒绝且不重新入队*==
+
+***生产者代码：***
+
+```java
+public class Producer {
+    private static final String NORMAL_QUEUE_NAME = "normal_queue";
+    private static final String NORMAL_EXCHANGE_NAME = "normal_exchange";
+
+    public static void main(String[] args) throws Exception {
+        Channel channel = RabbitMQUtils.getNewChannel();
+         //3.消息被拒绝，并且不重新入队
+        for (int i = 1; i < 11; i++) {
+            channel.basicPublish(
+                    NORMAL_EXCHANGE_NAME,
+                    "zhangsan",
+                    null,
+                    ("msg=" + i).getBytes(StandardCharsets.UTF_8)
+            );
+        }
+}
+```
+
+***普通消费者代码：***
+
+```java
+public class Consumer_1 {
+    private static final String NORMAL_EXCHANGE_NAME = "normal_exchange";
+    private static final String DEAD_EXCHANGE_NAME = "dead_exchange";
+    private static final String NORMAL_QUEUE_NAME = "normal_queue";
+    private static final String DEAD_QUEUE_NAME = "dead_queue";
+
+    public static void main(String[] args) throws IOException, TimeoutException {
+
+        //通过参数设置死信格式（通过队列的构造函数方式）
+        Map<String, Object> map = new HashMap<>();
+        /**
+         * 所有可以设置的参数 共11个见 0. queueDeclare所有参数解析
+         */
+        map.put("x-dead-letter-exchange",DEAD_EXCHANGE_NAME);//指明要转发到的指定死信交换机
+        map.put("x-dead-letter-routing-key","lisi");//指明要转发到的指定死信交换机的routingKey
+
+        Channel channel = RabbitMQUtils.getNewChannel();
+
+        //普通交换机和队列
+        channel.exchangeDeclare(NORMAL_EXCHANGE_NAME, BuiltinExchangeType.DIRECT);
+        channel.queueDeclare(NORMAL_QUEUE_NAME,false,false,false,map);
+        channel.queueBind(NORMAL_QUEUE_NAME,NORMAL_EXCHANGE_NAME,"zhangsan");
+        //创建死信队列
+        channel.exchangeDeclare(DEAD_EXCHANGE_NAME, BuiltinExchangeType.DIRECT);
+        channel.queueDeclare(DEAD_QUEUE_NAME,false,false,false,null);
+        channel.queueBind(DEAD_QUEUE_NAME,DEAD_EXCHANGE_NAME,"lisi");
+
+        channel.basicConsume(
+                NORMAL_QUEUE_NAME,
+                false,//一定要设置为手动应答 【自动应答不存在拒绝问题】
+                //正常消费
+                (consumerTag, message) -> {
+                    String msg = new String(message.getBody(), StandardCharsets.UTF_8);
+                    System.out.println("收到的消息msg 【" + msg + "】");
+                    //判断为死信
+                    //3.消息被拒绝,并且不重新入队
+                    if ("msg=5".equals(msg)) {
+                        channel.basicReject(message.getEnvelope().getDeliveryTag(),false);
+                        System.out.println(msg + "此消息是被拒绝的，且不重新入队。[死信队列]");
+                        //自动放入死信队列，不需要手动传递
+                        //channel.basicPublish(DEAD_EXCHANGE_NAME,"lisi",null,message.getBody());
+                    } else {
+                        // 手动应答，必须应答
+                        channel.basicAck(message.getEnvelope().getDeliveryTag(),false);
+                    }
+                },
+                //取消消费
+                consumerTag -> {
+                    //
+                    System.out.println("c1 取消消费！");
+                }
+        );
+    }
+}
+```
+
+***死信消费者代码：***
+
+和 上面情况代码完全一样
+
+***结果：***
+
+<img src='img\image-20221206110302146.png'>
 
 ## 2. 延迟队列
 
