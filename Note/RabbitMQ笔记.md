@@ -1615,6 +1615,404 @@ public class Consumer_1 {
 
 ## 2. 延迟队列
 
+### 2.1 概念
+
+​	延时队列,队列内部是有序的，最重要的特性就体现在它的延时属性上，延时队列中的元素是希望 在指定时间到了以后或之前取出和处理，简单来说，延时队列就是用来存放需要在指定时间被处理的 元素的队列。
+
+### 2.2 延迟队列适用场景
+
++ 订单在十分钟内未支付则自动取消
++ 新创建的店铺，如果在十天内都没有上传过商品，则自动发送消息提醒。
++ 用户注册成功后，如果三天内没有登陆则进行短信提醒。
++ 用户发起退款，如果三天内没有得到处理则通知相关运营人员。
++ 预定会议后，需要在预定的时间点前十分钟通知各个与会人员参加会议
+
+> ​	这些场景都有一个特点，需要在某个事件发生之后或者之前的指定时间点完成某一项任务，如： 发生订单生成事件，在十分钟之后检查该订单支付状态，然后将未支付的订单进行关闭；看起来似乎 使用定时任务，一直轮询数据，每秒查一次，取出需要被处理的数据，然后处理不就完事了吗？如果 数据量比较少，确实可以这样做，比如：对于“如果账单一周内未支付则进行自动结算”这样的需求， 如果对于时间不是严格限制，而是宽松意义上的一周，那么每天晚上跑个定时任务检查一下所有未支 付的账单，确实也是一个可行的方案。
+>
+> 但对于数据量比较大，并且时效性较强的场景，如：“订单十 分钟内未支付则关闭“，短期内未支付的订单数据可能会有很多，活动期间甚至会达到百万甚至千万 级别，对这么庞大的数据量仍旧使用轮询的方式显然是不可取的，很可能在一秒内无法完成所有订单 的检查，同时会给数据库带来很大压力，无法满足业务要求而且性能低下。
+>
+> <img src='img\image-20221206161851525.png'>
+
+### 2.3 RabbitMQ中的TTL
+
+​	TTL 是什么呢？TTL 是 RabbitMQ 中一个消息或者队列的属性，表明一条消息或者该队列中的所有 消息的最大存活时间，单位是毫秒。
+
+​	换句话说，如果一条消息设置了 TTL 属性或者进入了设置TTL 属性的队列，那么这 条消息如果在TTL 设置的时间内没有被消费，则会成为"死信"。如果同时配置了队列的TTL 和消息的 TTL，那么较小的那个值将会被使用，有两种方式设置 TTL。
+
+#### 2.3.1 单独消息设置TTL(Producer)
+
+```java
+ //1、生产者指定单个消息过期时间
+channel.basicPublish(
+    NORMAL_EXCHANGE_NAME,
+    "zhangsan",
+    //设置消息的属性 如路由头，持久化，过期时间等等
+    new AMQP.BasicProperties().builder().expiration("10000").priority(0).build(),//过期时间单位毫秒,优先级为0
+    "hello dead-letter".getBytes(StandardCharsets.UTF_8)
+);
+```
+
+#### 2.3.2 批量消息设置TTL
+
+```java
+//过期时间： 2、设置队列中所有消息的过期时间
+map.put("x-message-ttl",10000);//单位毫秒 10s 属于设置队列中所有消息的属性，不推荐；因为每个消息的过期时间应该不一样（所以应该由生产者发送消息时指定过期时间时间）
+channel.queueDeclare(NORMAL_QUEUE_NAME,false,false,false,map);
+```
+
+#### 2.3.3 队列设置TTL
+
+```java
+map.put("x-expires",10000);//10秒内没访问此队列，队列被删除
+channel.queueDeclare(NORMAL_QUEUE_NAME,false,false,false,map);
+```
+
+#### 2.3.4 注意
+
+​	如果设置了**队列的 TTL 属性**，那么一旦消息过期，就会被队列丢弃(如果配置了死信队列被丢到死信队 列中)，而**如果设置消息的TTL属性**，消息即使过期，也不一定会被马上丢弃，因为消息是否过期是在即将投递到消费者 之前判定的，如果当前队列有严重的消息积压情况，则已过期的消息也许还能存活较长时间。
+
+​	另外，还需 要注意的一点是，如果**不设置 TTL，表示消息永远不会过期**，如果将 **TTL 设置为 0，则表示除非此时可以 直接投递该消息到消费者，否则该消息将会被丢弃**。
+
+​	前一小节我们介绍了死信队列，刚刚又介绍了 TTL，至此利用 RabbitMQ 实现延时队列的两大要素已 经集齐，接下来只需要将它们进行融合，再加入一点点调味料，延时队列就可以新鲜出炉了。想想看，延 时队列，不就是想要消息延迟多久被处理吗，TTL 则刚好能让消息在延迟多久之后成为死信，另一方面， 成为死信的消息都会被投递到死信队列里，这样只需要消费者一直消费死信队列里的消息就完事了，因为 里面的消息都是希望被立即处理的消息。
+
+### 2.4 ==*RabbitMQ整合SpringBoot[延迟队列]***==\*
+
+<img src='img\image-20221206163726893.png'>
+
+#### 2.4.1 创建项目
+
+#### 2.4.2 导入依赖
+
+```xml
+<!-- 
+	jdk:1.8
+	springboot:2.3.11.RELEASE
+-->
+<dependencies>
+    <!--RabbitMQ 依赖 核心就这两个spring-boot-starter-amqp 和 spring-boot-starter-web-->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-amqp</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+    <!--注解配置驱动器 暂时未用到-->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-configuration-processor</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.alibaba</groupId>
+        <artifactId>fastjson</artifactId>
+        <version>1.2.47</version>
+    </dependency>
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+    </dependency>
+    <!--swagger 页面测试 暂时未用到-->
+    <dependency>
+        <groupId>io.springfox</groupId>
+        <artifactId>springfox-swagger2</artifactId>
+        <version>2.9.2</version>
+    </dependency>
+    <dependency>
+        <groupId>io.springfox</groupId>
+        <artifactId>springfox-swagger-ui</artifactId>
+        <version>2.9.2</version>
+    </dependency>
+    <!--RabbitMQ 测试依赖 暂时未用到-->
+    <dependency>
+        <groupId>org.springframework.amqp</groupId>
+        <artifactId>spring-rabbit-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
+```
+
+#### 2.4.3 配置连接信息
+
+```yaml
+spring:
+  rabbitmq:
+    host: 192.168.77.3
+    username: ly
+    password: 1024
+```
+
+#### 2.4.4 配置AMQP连接组件
+
+```java
+/**
+ * FileName:TtlQueueConfig.class
+ * Author:ly
+ * Date:2022/12/6 0006
+ * Description: 专门用于配置 普通交换机，队列，以及死信队列和 所有的路由key
+ */
+@SuppressWarnings({"all"})
+@Configuration
+public class TtlQueueConfig {
+
+    //普通交换机 X type=direct
+    public static final String X_EXCHANGE =  "X";
+    //普通队列 QA
+    public static final String QA_NORMAL_QUEUE = "QA";
+    //普通队列 QB
+    public static final String QB_NORMAL_QUEUE = "QB";
+    //普通队列 QA ttl=10s routingKey=XA
+    public static final String XA_NORMAL_ROUTE_KEY = "XA";
+    //普通队列 QB ttl=40s routingKey=XB
+    public static final String XB_NORMAL_ROUTE_KEY = "XB";
+
+    //死信交换机 Y type=direct
+    public static final String Y_EXCHANGE = "Y";
+    //死信队列 QD routingKey=YD
+    public static final String QD_DEAD_QUEUE = "QD";
+    //死信队列 QD routingKey=YD
+    public static final String DEAD_ROUTE_KEY = "YD";
+```
+
+##### 2.4.4.1 创建普通交换机X
+
+```java
+/**
+ * 普通交换机X
+ *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+ * @return 普通交换机X
+ */
+@Bean(name = X_EXCHANGE)
+public DirectExchange getNormalExchangeX() {
+    return new DirectExchange(X_EXCHANGE);
+}
+```
+
+<img src='img\image-20221206164215250.png'>
+
+##### 2.4.4.2 创建普通队列QA
+
+```java
+/**
+     * 普通队列QA 持久化，共享，不自动删除 [但是没有绑定路由key]
+     * @ttl=10s
+     * @x-letter-exchange=Y
+     * @x-letter-route-key=YD
+     *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+     * @return 普通队列QA
+     */
+@Bean(name = QA_NORMAL_QUEUE)
+public Queue getNormalQueueQA() {
+    return QueueBuilder
+        .durable(QA_NORMAL_QUEUE)
+        .deadLetterExchange(Y_EXCHANGE)
+        .deadLetterRoutingKey(DEAD_ROUTE_KEY)
+        .ttl(10000)
+        .build();
+}
+```
+
+<img src='img\image-20221206164323511.png'>
+
+##### 2.4.4.3 创建普通队列QB
+
+```java
+/**
+ * 普通队列QB 持久化，共享，不自动删除 [但是没有绑定路由key]
+ * @ttl=40s
+ * @x-letter-exchange=Y
+ * @x-letter-route-key=YD
+ *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+ * @return 普通队列QB
+ */
+@Bean(name = QB_NORMAL_QUEUE)
+public Queue getNormalQueueQB() {
+    return QueueBuilder
+            .durable(QB_NORMAL_QUEUE)
+            .deadLetterExchange(Y_EXCHANGE)
+            .deadLetterRoutingKey(DEAD_ROUTE_KEY)
+            .ttl(40000)
+            .build();
+}
+```
+
+<img src='img\image-20221206164620896.png'>
+
+##### 2.4.4.4 将QA和X绑定
+
+```java
+/**
+ *  普通绑定关系XA 实体类 【包含queue、exchange、routingKey】
+ *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+ * @QA 要绑定的队列 [自动注入（名字或类型） @Autowire省略]
+ * @X 要绑定到的交换机 [自动注入（名字或类型） @Autowire省略]
+ * @return 绑定关系实体类
+ */
+@Bean(name = XA_NORMAL_ROUTE_KEY)
+public Binding getBingXA(Queue QA, DirectExchange X){
+    return BindingBuilder
+            .bind(QA)
+            .to(X)
+            .with(XA_NORMAL_ROUTE_KEY);
+}
+```
+
+<img src='img\image-20221206164722552.png'>
+
+##### 2.4.4.5 将QB和X绑定
+
+```java
+/**
+ *  普通绑定关系XB 实体类 【包含queue、exchange、routingKey】
+ *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+ * @QB 要绑定的队列 [自动注入（名字或类型） @Autowire省略]
+ * @X 要绑定到的交换机 [自动注入（名字或类型） @Autowire省略]
+ * @return 绑定关系实体类
+ */
+@Bean(name = XB_NORMAL_ROUTE_KEY)
+public Binding getBingXB(@Autowired Queue QB, @Autowired DirectExchange X){
+    return BindingBuilder
+            .bind(QB)
+            .to(X)
+            .with(XB_NORMAL_ROUTE_KEY);
+}
+```
+
+<img src='img\image-20221206164831593.png'>
+
+##### 2.4.4.6 创建死信交换机Y
+
+```java
+/**
+ * 死信交换机Y
+ *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+ * @return 死信交换机Y
+ */
+@Bean(name = Y_EXCHANGE)
+public DirectExchange getDeadLetterExchangeY() {
+    return new DirectExchange(Y_EXCHANGE);
+}
+```
+
+<img src='img\image-20221206165015886.png'>
+
+##### 2.4.4.7 创建死信队列QD
+
+```java
+/**
+ * 死信队列QD 持久化，共享，不自动删除 [但是没有绑定路由key]
+ *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+ * @return 普通队列QA
+ */
+@Bean(name = QD_DEAD_QUEUE)
+public Queue getDeadLetterQueueQD() {
+    return QueueBuilder
+            .durable(QD_DEAD_QUEUE)
+            .build();
+}
+```
+
+<img src='img\image-20221206165110601.png'>
+
+##### 2.4.4.8 将QD和Y绑定
+
+```java
+/**
+ *  死信队列绑定关系YD 实体类 【包含queue、exchange、routingKey】
+ *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+ * @QD 要绑定的队列 [自动注入（名字或类型） @Autowire省略]
+ * @Y 要绑定到的交换机 [自动注入（名字或类型） @Autowire省略]
+ * @return 绑定关系实体类
+ */
+@Bean(name = DEAD_ROUTE_KEY)
+public Binding getBingYD(Queue QD,DirectExchange Y){
+    return BindingBuilder
+            .bind(QD)
+            .to(Y)
+            .with(DEAD_ROUTE_KEY);
+}
+```
+
+<img src='img\image-20221206165206444.png'>
+
+#### 2.4.5 构建生产者
+
+```java
+/**
+ * FileName:MsgConroller.class
+ * Author:ly
+ * Date:2022/12/6 0006
+ * Description: 通过请求发送(延迟)数据 - 生产者
+ */
+@Slf4j
+@RestController
+@RequestMapping(path = "/ttl")
+public class MsgController {
+
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    @RequestMapping(path = "/sendMsg/{msg}")
+    public String hello(@PathVariable("msg") String msg) {
+        log.info("{} 接收到生产者消息：{}",new Date().toString(),msg);
+
+        //发送到延迟10s的 队列
+        rabbitTemplate.convertSendAndReceive(
+                "X",
+                "XA",
+                "[ttl_10_s] " + msg
+        );
+
+        //发送到延迟40s的 队列
+        rabbitTemplate.convertSendAndReceive(
+                "X",
+                "XB",
+                "[ttl_40_s] " + msg
+        );
+
+        return "OK";
+    }
+}
+```
+
+#### 2.4.5 构建消费者
+
+```java
+/**
+ * FileName:DeadLetterQueueConsumer.class
+ * Author:ly
+ * Date:2022/12/6 0006
+ * Description: 死信消费者，是一个监听器
+ */
+@Slf4j
+@Component
+public class DeadLetterQueueConsumer {
+
+    @RabbitListener(queues = {"QD"})
+    public void consumeMessageOfQD(Message message, Channel channel) {
+        String msg = new String(message.getBody(), StandardCharsets.UTF_8);
+        log.info("{} 接收到死信队列消息：{}",new Date().toString(),msg);
+    }
+}
+```
+
+#### 2.4.6 运行测试
+
+发送GET请求：`http://localhost:8080/ttl/sendMsg/%E4%BD%A0%E5%A5%BD%20AMQP`
+
+<img src='img\image-20221206165634064.png'>
+
+​	第一条消息在 10S 后变成了死信消息，然后被消费者消费掉，第二条消息在 40S 之后变成了死信消息， 然后被消费掉，这样一个延时队列就打造完成了。
+
+ 不过，如果这样使用的话，**岂不是每增加一个新的时间需求，就要新增一个队列**，这里只有 10S 和 40S 两个时间选项，如果需要一个小时后处理，那么就需要增加TTL 为一个小时的队列，如果是预定会议室然 后提前通知这样的场景，岂不是要增加无数个队列才能满足需求？
+
+### 2.5 延迟队列优化
+
 ## 3.  发布确认高级
 
 ### 3.1 发布确认
