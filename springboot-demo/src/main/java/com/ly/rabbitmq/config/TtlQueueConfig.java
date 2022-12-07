@@ -34,6 +34,11 @@ public class TtlQueueConfig {
     //死信队列 QD routingKey=YD
     public static final String DEAD_ROUTE_KEY = "YD";
 
+    //普通队列（动态延迟时间，即延迟时间为发消息时决定的）
+    public static final String QC_NORMAL_QUEUE = "QC";
+    //普通队列 QC ttl由生产者决定 routingKey=XC
+    public static final String XC_NORMAL_ROUTE_KEY = "XC";
+
     /**
      * 普通交换机X
      *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
@@ -146,5 +151,40 @@ public class TtlQueueConfig {
                 .bind(QD)
                 .to(Y)
                 .with(DEAD_ROUTE_KEY);
+    }
+
+
+
+    //QC
+    /**
+     * 普通队列QC 持久化，共享，不自动删除 [但是没有绑定路由key]
+     *  ttl不指定，消息过期时间由发送者指定单个消息的过期时间
+     * @x-letter-exchange=Y
+     * @x-letter-route-key=YD
+     *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+     * @return 普通队列QC
+     */
+    @Bean(name = QC_NORMAL_QUEUE)
+    public Queue getNormalQueueQC() {
+        return QueueBuilder
+                .durable(QC_NORMAL_QUEUE)
+                .deadLetterExchange(Y_EXCHANGE)
+                .deadLetterRoutingKey(DEAD_ROUTE_KEY)
+                .build();
+    }
+
+    /**
+     *  队列绑定关系XC 实体类 【包含queue、exchange、routingKey】
+     *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+     * @QC 要绑定的队列 [自动注入（名字或类型） @Autowire省略]
+     * @X 要绑定到的交换机 [自动注入（名字或类型） @Autowire省略]
+     * @return 绑定关系实体类
+     */
+    @Bean(name = XC_NORMAL_ROUTE_KEY)
+    public Binding getBingXC(Queue QC,DirectExchange X){
+        return BindingBuilder
+                .bind(QC)
+                .to(X)
+                .with(XC_NORMAL_ROUTE_KEY);
     }
 }

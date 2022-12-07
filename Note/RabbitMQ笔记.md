@@ -150,9 +150,10 @@ RabbitMQ 是一个消息中间件：它接受并转发消息。你可以把它�
 
 ```sh
 # 下载 erlang-21.3.8.14-1.el7.x86_64.rpm 
-curl -s https://packagecloud.io/install/repositories/rabbitmq/erlang/script.rpm.sh | sudo bash
-sudo yum install erlang-21.3.8.14-1.el7.x86_64
-
+//curl -s https://packagecloud.io/install/repositories/rabbitmq/erlang/script.rpm.sh | sudo bash
+//sudo yum install erlang-21.3.8.14-1.el7.x86_64
+# l
+rpm -ivh erlang-21.3-1.el7.x86_64.rpm
 # 检验erlang是否成功安装
 erl
 ssl:versions().  #注意最后面有个点的
@@ -1675,7 +1676,7 @@ channel.queueDeclare(NORMAL_QUEUE_NAME,false,false,false,map);
 
 ​	前一小节我们介绍了死信队列，刚刚又介绍了 TTL，至此利用 RabbitMQ 实现延时队列的两大要素已 经集齐，接下来只需要将它们进行融合，再加入一点点调味料，延时队列就可以新鲜出炉了。想想看，延 时队列，不就是想要消息延迟多久被处理吗，TTL 则刚好能让消息在延迟多久之后成为死信，另一方面， 成为死信的消息都会被投递到死信队列里，这样只需要消费者一直消费死信队列里的消息就完事了，因为 里面的消息都是希望被立即处理的消息。
 
-### 2.4 ==*RabbitMQ整合SpringBoot[延迟队列]***==\*
+### 2.4 ==***RabbitMQ整合SpringBoot[延迟队列]***==\*
 
 <img src='img\image-20221206163726893.png'>
 
@@ -2011,7 +2012,104 @@ public class DeadLetterQueueConsumer {
 
  不过，如果这样使用的话，**岂不是每增加一个新的时间需求，就要新增一个队列**，这里只有 10S 和 40S 两个时间选项，如果需要一个小时后处理，那么就需要增加TTL 为一个小时的队列，如果是预定会议室然 后提前通知这样的场景，岂不是要增加无数个队列才能满足需求？
 
-### 2.5 延迟队列优化
+### 2.5 延迟队列优化1--==***自定义消息ttl***==
+
+​	上面的延迟队列是通过设置队列ttl属性来实现的，但是这又造成一个问题：即所有的消息的过期时间确定了，如果想发送自定义过期时间那么怎么实现呢？**通过Message的后置处理器，来实现生产者发送延迟消息，不需要再设置队列的ttl属性。**
+
+<img src='img\image-20221207104833871.png'>
+
+#### 2.5.1 建立普通队列QC
+
+```java
+/**
+ * 普通队列QC 持久化，共享，不自动删除 [但是没有绑定路由key]
+ *  ttl不指定，消息过期时间由发送者指定单个消息的过期时间
+ * @x-letter-exchange=Y
+ * @x-letter-route-key=YD
+ *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+ * @return 普通队列QC
+ */
+@Bean(name = QC_NORMAL_QUEUE)
+public Queue getNormalQueueQC() {
+    return QueueBuilder
+            .durable(QC_NORMAL_QUEUE)
+            .deadLetterExchange(Y_EXCHANGE)
+            .deadLetterRoutingKey(DEAD_ROUTE_KEY)
+            .build();
+}
+```
+
+<img src='img\image-20221207105204548.png'>
+
+#### 2.5.2 将QC和X绑定
+
+```java
+/**
+ *  队列绑定关系XC 实体类 【包含queue、exchange、routingKey】
+ *      被当成了ioc组件 (注意：beanName是ioc容器中的名字，不是amqp中的)
+ * @QC 要绑定的队列 [自动注入（名字或类型） @Autowire省略]
+ * @X 要绑定到的交换机 [自动注入（名字或类型） @Autowire省略]
+ * @return 绑定关系实体类
+ */
+@Bean(name = XC_NORMAL_ROUTE_KEY)
+public Binding getBingXC(Queue QC,DirectExchange X){
+    return BindingBuilder
+            .bind(QC)
+            .to(X)
+            .with(XC_NORMAL_ROUTE_KEY);
+}
+```
+
+<img src='img\image-20221207105308817.png'>
+
+#### 2.5.3 构建生产者
+
+```java
+    /**
+     * 发送 自定义延迟时间的消息
+     * 但是存在问题：先入先出 ，会堵塞后面过期时间短的
+     *      如：第一个消息：m1 延迟20s
+     *          第二个消息：m2 延迟2s
+     *          本来以为是2秒后m2先出来，
+     *              实际是20秒后m1出来，然后m2出来
+     */
+    rabbitTemplate.convertSendAndReceive(
+            "X",
+            "XC",
+            "[sendExpMsg] " + msg,
+            //message 的后置处理器，将消息object类型转化为Message类型后调用
+            message -> {
+                message.getMessageProperties().setExpiration(ttl);//单位ms
+                return message;
+            }
+    	);
+    	return "ok";
+	}
+```
+
+#### 2.5.4 测试
+
+发送请求1：`http://localhost:8080/ttl/sendExpMsg/hello 1/30000`
+
+发送请求2：`http://localhost:8080/ttl/sendExpMsg/hello 2/2000`
+
+<img src='img\image-20221207105731462.png'>
+
+#### 2.5.5 缺陷（无法解决）
+
+​	执行结果看起来似乎没什么问题，但是在最开始的时候，就介绍过如果使用在消息属性上设置 TTL 的方式，**消 息可能并不会按时“死亡“**，因为 **RabbitMQ 只会检查第一个消息是否过期**，如果过期则丢到死信队列，**如果第一个消息的延时时长很长，而第二个消息的延时时长很短，第二个消息并不会优先得到执行**。
+
+​	由于队列的特性先入先出，且rabbitmq只会检测第一条消息的ttl属性，这就导致后面发的短的消息无法及时释放，被阻塞。
+
+如：第一个消息：m1 延迟20s第二个消息：m2 延迟2s。本来以为是2秒后m2先出来，实际是20秒后m1出来，然后m2出来。
+
+### 2.6 延迟队列优化2--==***解决队列消息不会按时死亡的缺陷***==
+
+​	上文中提到的问题，确实是一个问题，如果不能实现在消息粒度上的 TTL，并使其在设置的TTL 时间 及时死亡，就无法设计成一个通用的延时队列。那如何解决呢，接下来我们就去解决该问题。
+
+#### 2.6.1 安装延时队列插件
+
+
 
 ## 3.  发布确认高级
 
