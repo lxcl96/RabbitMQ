@@ -3,6 +3,7 @@ package com.ly.rabbitmq.controller;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.DirectExchange;
 import org.springframework.amqp.core.MessageProperties;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Controller;
@@ -71,5 +72,49 @@ public class MsgController {
                 }
         );
         return "ok";
+    }
+
+    /**
+     * 基于延迟交换机的延迟消息
+     * @param msg 消息
+     * @param ttl 延迟时间
+     * @return
+     */
+    @GetMapping("/sendDelayedMessage/{msg}/{ttl}")
+    public String sendDelayedMessage(@PathVariable String msg, @PathVariable Integer ttl){
+        log.info("{} [sendDelayedMessage] 接收到生产者消息：{},过期时间为{}ms",new Date().toString(),msg,ttl);
+
+        rabbitTemplate.convertAndSend(
+                "delayed.exchange",
+                "delayed.routingKey",
+                "[sendDelayedMessage] " + msg,
+                message -> {
+                    //注意看不是 setExpiration
+                    message.getMessageProperties().setDelay(ttl);
+                    return message;
+                }
+                );
+        return "OK";
+    }
+
+    /**
+     * 发布确认高级 - rabbitmq服务宕机消息丢失
+     * @param msg 消息
+     * @return ok
+     */
+    @GetMapping("/sendConfirmMsg/{msg}")
+    public String sendConfirmMsg(@PathVariable String msg){
+        log.info("{} [sendConfirmMsg] 接收到生产者消息：{}",new Date(),msg);
+
+        CorrelationData data = new CorrelationData(msg.length() + "");
+
+        rabbitTemplate.convertAndSend(
+                "confirm.exchange",
+                "kk",
+                "[sendConfirmMsg] " + msg,
+                message -> {return message;},
+                data
+        );
+        return "OK";
     }
 }

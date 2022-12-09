@@ -152,7 +152,7 @@ RabbitMQ 是一个消息中间件：它接受并转发消息。你可以把它�
 # 下载 erlang-21.3.8.14-1.el7.x86_64.rpm 
 //curl -s https://packagecloud.io/install/repositories/rabbitmq/erlang/script.rpm.sh | sudo bash
 //sudo yum install erlang-21.3.8.14-1.el7.x86_64
-# l
+# 离线下载
 rpm -ivh erlang-21.3-1.el7.x86_64.rpm
 # 检验erlang是否成功安装
 erl
@@ -2109,7 +2109,140 @@ public Binding getBingXC(Queue QC,DirectExchange X){
 
 #### 2.6.1 安装延时队列插件
 
+在官网上下载 https://www.rabbitmq.com/community-plugins.html，下载 rabbitmq_delayed_message_exchange 插件，然后放置到 RabbitMQ 的插件目录，然后执行插件安装命令。
 
+```sh
+# 放到rabbitmq插件目录
+cp rabbitmq_delayed_message_exchange-3.8.0.ez /usr/lib/rabbitmq/lib/rabbitmq_server-3.8.8/plugins/
+# 开启插件
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+# 重启rabbitmq服务
+systemctl restart rabbitmq-server
+```
+
+<img src='img\image-20221209105441607.png'>
+
+<img src='img\image-20221209105606339.png'>
+
+#### 2.6.2 基于插件的延迟队列原理
+
+<img src='img\image-20221209105704768.png'>
+
+<img src='img\image-20221209105727769.png'>
+
+#### 2.6.3 代码架构图
+
+<img src='img\image-20221209105940194.png'>
+
+```java
+@Configuration
+public class DelayedQueueConfig {
+    public static final String DELAYED_EXCHANGE = "delayed.exchange";
+    public static final String DELAYED_QUEUE = "delayed.queue";
+    public static final String DELAYED_ROUTE_KEY = "delayed.routingKey";
+    public static final String DELAYED_EXCHANGE_TYPE = "x-delayed-message";
+```
+
+#### 2.6.4 创建延迟交换机*
+
+```java
+/**
+ * 基于延迟插件的延迟交换机
+ * @return 自定义交换机即 x-delayed-message
+ */
+@Bean(DELAYED_EXCHANGE)
+public CustomExchange getDelayedExchange(){
+    Map<String, Object> map = new HashMap<>();
+    map.put("x-delayed-type","direct"); //定义自定义交换机的参数
+    return new CustomExchange(DELAYED_EXCHANGE,DELAYED_EXCHANGE_TYPE,true,false,map);
+}
+```
+
+#### 2.6.5 创建普通队列
+
+```java
+/**
+ * 消息的延迟由交换机决定，则队列直接用于消费即可
+ * @return 延迟队列（其实就是一个没有任何属性的普通队列）
+ */
+@Bean(DELAYED_QUEUE)
+public Queue getDelayedQueue(){
+    return QueueBuilder.durable(DELAYED_QUEUE).build();
+}
+```
+
+#### 2.6.6 绑定关系
+
+```java
+/**
+ * 自定义的延迟交换机
+ * @param queue 延迟队列
+ * @param exchange 延迟交换机
+ * @return 延迟交换机和延迟队列的绑定关系机路由key
+ */
+@Bean(DELAYED_ROUTE_KEY)
+public Binding getBingDelayed(@Qualifier(DELAYED_QUEUE) Queue queue,
+                              @Qualifier(DELAYED_EXCHANGE) CustomExchange exchange){
+    return BindingBuilder
+            .bind(queue)
+            .to(exchange)
+            .with(DELAYED_ROUTE_KEY)
+            .noargs();
+}
+```
+
+#### 2.6.7 创建生产者
+
+只有延迟函数setDelay变了，其余没变
+
+```java
+/**
+ * 基于延迟交换机的延迟消息
+ * @param msg 消息
+ * @param ttl 延迟时间
+ * @return
+ */
+@GetMapping("/sendDelayedMessage/{msg}/{ttl}")
+public String sendDelayedMessage(@PathVariable String msg, @PathVariable Integer ttl){
+    log.info("{} [sendDelayedMessage] 接收到生产者消息：{},过期时间为{}ms",new Date().toString(),msg,ttl);
+
+    rabbitTemplate.convertAndSend(
+            "delayed.exchange",
+            "delayed.routingKey",
+            "[sendDelayedMessage] " + msg,
+            message -> {
+                //注意看不是 setExpiration
+                message.getMessageProperties().setDelay(ttl);
+                return message;
+            }
+            );
+    return "OK";
+}
+```
+
+#### 2.6.8 创建消费者
+
+```java
+@Slf4j
+@Component
+public class DelayedQueueConsumer {
+
+    @RabbitListener(queues = DelayedQueueConfig.DELAYED_QUEUE)
+    public void consumer(Message message, Channel channel) {
+        String msg = new String(message.getBody(), StandardCharsets.UTF_8);
+        log.info("{} 接收到延迟队列消息：{}",new Date().toString(),msg);
+    }
+
+}
+```
+
+#### 2.6.9 测试
+
+第一次发送请求：`http://localhost:8080/ttl/sendDelayedMessage/hello 1/40000`
+
+第二次发送请求：`http://localhost:8080/ttl/sendDelayedMessage/hello 2/2000`
+
+<img src='img\image-20221209110454802.png'>
 
 ## 3.  发布确认高级
 
