@@ -2246,7 +2246,7 @@ public class DelayedQueueConsumer {
 
 <img src='img\image-20221209110454802.png'>
 
-## 3.  发布确认高级
+## 3.  发布确认(SpringBoot版)
 
 ​	***即SpringBoot版本的发布确认***
 
@@ -2495,17 +2495,332 @@ spring:
 
 ### 3.3. 备份交换机
 
+​	在 RabbitMQ 中，有一种备份交换机的机制存在，可以很好的应对这个问题。什么是备份交换机呢？备份 交换机可以理解为 RabbitMQ 中交换机的“备胎”，当我们为某一个交换机声明一个对应的备份交换机时，就 是为它创建一个备胎，当交换机接收到一条不可路由消息时，将会把这条消息转发到备份交换机中，由备 份交换机来进行转发和处理，通常备份交换机的类型为 Fanout ，这样就能把所有消息都投递到与其绑定 的队列中，然后我们在备份交换机下绑定一个队列，这样所有那些原交换机无法被路由的消息，就会都进 入这个队列了。当然，我们还可以建立一个报警队列，用独立的消费者来进行监测和报警。
 
+#### 3.3.1 代码架构图
+
+<img src='img\image-20221210183148110.png'>
+
+#### 3.3.2  修改配置类
+
+```java
+/**
+ * 备份交换机、备份队列（备份消费者）以及告警系列（告警消费者）
+ */
+@Bean(BACKUP_EXCHANGE)
+public FanoutExchange getBackupExchange() {
+    return ExchangeBuilder.fanoutExchange(BACKUP_EXCHANGE).durable(true).build();
+}
+@Bean(BACKUP_QUEUE)
+public Queue getBackupQueue(){
+    return QueueBuilder.durable(BACKUP_QUEUE).build();
+}
+
+@Bean
+public Binding bindBackupExchangeAndQueue(
+        @Qualifier(BACKUP_QUEUE) Queue queue,
+        @Qualifier(BACKUP_EXCHANGE) FanoutExchange exchange){
+    return BindingBuilder.bind(queue).to(exchange);
+}
+//警告队列
+@Bean(WARNING_QUEUE)
+public Queue getWarningQueue(){
+    return QueueBuilder.durable(WARNING_QUEUE).build();
+}
+
+@Bean
+public Binding bindBackupExchangeAndWarningQueue(
+        @Qualifier(WARNING_QUEUE) Queue queue,
+        @Qualifier(BACKUP_EXCHANGE) FanoutExchange exchange){
+    return BindingBuilder.bind(queue).to(exchange);
+}
+```
+
+#### 3.3.3 生产者
+
+```java
+@Slf4j
+@RestController
+@RequestMapping("/publishConfirm")
+public class PublishConfirmController {
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    /**
+     * 发布确认高级 - rabbitmq服务宕机消息丢失
+     * @param msg 消息
+     * @return ok
+     */
+    @GetMapping("/sendMsg/{msgType}/{msg}")
+    public String sendConfirmMsg(@PathVariable String msgType, @PathVariable String msg){
+        log.info("{} [sendConfirmMsg] 接收到生产者消息：{}，类型为：{}",new Date(),msg,msgType);
+        String routingKey = "k1";
+        if ("error".equals(msgType)) {
+            //错误消息
+            routingKey = "error";
+        }
+        rabbitTemplate.convertAndSend(
+                "confirm.exchange",
+                routingKey,
+                msg,
+                new CorrelationData(msg.length() + "")
+        );
+        return "OK";
+    }
+}
+```
+
+#### 3.3.4 不可路由回调函数
+
+```java
+@Slf4j
+@Component
+public class MyMessagePublishCallback implements RabbitTemplate.ConfirmCallback,RabbitTemplate.ReturnCallback {
+
+    //将自己写的回调函数注入到组件的属性中
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    @Override
+    public void confirm(CorrelationData correlationData, boolean ack, String cause) {
+        //这个是针对交换机的，交换机接受到消息就返回true，不管队列有没有收到
+        if (ack) {
+            log.info("[ConfirmCallback] 消息发布成功！,消息id{}",correlationData.getId());
+        } else {
+            log.info("消息发布失败，原因：{}",cause);
+        }
+    }
+
+    //构造完再更新默认组件RabbitTemplate的属性
+    @PostConstruct
+    public void injectAttribute(){
+        //System.out.println("构造完再更新默认组件RabbitTemplate的属性");
+        rabbitTemplate.setConfirmCallback(this);
+        rabbitTemplate.setReturnCallback(this);//千万别忘记注入
+    }
+
+	
+    /*
+    当然这里还有一张方法就是给交换机添加参数"alternate-exchange"，类似于死信队列由rabbitmq的交换机自动转到备用交换机  
+    */
+    @Override
+    public void returnedMessage(Message message, int replyCode, String replyText, String exchange, String routingKey) {
+        String msg = new String(message.getBody(), StandardCharsets.UTF_8);
+        log.info("回退消息：【{}】返回代码replyCode：{},返回内容replyText：{},交换机：{},路由key:{}",
+                msg,replyCode,replyText,exchange,routingKey);
+
+        //投递到备用交换机(每次重新发送说明correlationID会丢失，除非包装在Message中)
+        log.info("准备将无路由消息id：{}投递到备用交换机：{}",message.getMessageProperties().getCorrelationId(), PublishConfirmAdvanceConfig.BACKUP_EXCHANGE);
+
+        rabbitTemplate.convertAndSend(
+                PublishConfirmAdvanceConfig.BACKUP_EXCHANGE,
+                "",//fanout交换机的路由key就null
+                msg,
+                //因为ConfirmCallBack调用中会获取每次消息的correlationDataID，所以每次发布消息都要带上否则会空指针
+                new CorrelationData("1" + msg.length())
+        );
+        log.info("消息投递成功！");
+
+    }
+}
+```
+
+#### 3.3.5 消费者
+
+```java
+@Slf4j
+@Component
+public class PublishConfirmAdvanceConsumer {
+
+    @RabbitListener(queues = {PublishConfirmAdvanceConfig.CONFIRM_QUEUE,PublishConfirmAdvanceConfig.BACKUP_QUEUE,PublishConfirmAdvanceConfig.WARNING_QUEUE})
+    public void doConsume(Message message){
+        String consumer = "";
+        String consumerQueue = message.getMessageProperties().getConsumerQueue();
+        String msg = new String(message.getBody(), StandardCharsets.UTF_8);
+
+        if (PublishConfirmAdvanceConfig.CONFIRM_QUEUE.equals(consumerQueue)) {
+            consumer = "消费者1";
+        } else if (PublishConfirmAdvanceConfig.BACKUP_QUEUE.equals(consumerQueue)) {
+            consumer = "备份队列消费者";
+        } else if (PublishConfirmAdvanceConfig.WARNING_QUEUE.equals(consumerQueue)) {
+            consumer = "警告队列消费者";
+        }
+        log.info("{} 接收到confirm消息：{}",consumer,msg);
+    }
+
+
+}
+```
+
+#### 3.3.6 测试
+
++ 正确可路由消息
+
+  发送请求：`http://localhost:8080/publishConfirm/sendMsg/normal/你好，张三`
+
+  <img src='img\image-20221210184036057.png'>
+
++ 失败不可路由消息
+
+  发送请求：`http://localhost:8080/publishConfirm/sendMsg/error/你好，张三`
+
+  <img src='img\image-20221210184120492.png'>
+
+#### 3.3.7 使用默认交换机转发功能代替不可路由回调函数*
+
+```java
+//配置类中添加交换机参数
+@Bean(CONFIRM_EXCHANGE)
+public DirectExchange getExchangeInstance(){
+    return ExchangeBuilder
+            .directExchange(CONFIRM_EXCHANGE)
+            .durable(true)
+            //设置备用交换机（不可路由消息）
+            .withArgument("alternate-exchange",BACKUP_EXCHANGE)
+            .build();
+}
+
+//代替了 不可路由回调函数 RabbitTemplate.ReturnCallback 函数
+```
+
+#### 3.3.8 注意*
+
+mandatory（不可路由函数） 参数与备份交换机可以一起使用的时候，如果两者同时开启，消息究竟何去何从？谁优先 级高，经过上面结果显示答案是**备份交换机优先级高**。
 
 ## 4. 幂等性
 
+### 4.1 概念
 
+​	用户对于同一操作发起的一次请求或者多次请求的结果是一致的，不会因为多次点击而产生了副作用。 举个最简单的例子，那就是支付，用户购买商品后支付，支付扣款成功，但是返回结果的时候网络异常， 此时钱已经扣了，用户再次点击按钮，此时会进行第二次扣款，返回结果成功，用户查询余额发现多扣钱 了，流水记录也变成了两条。在以前的单应用系统中，我们只需要把数据操作放入事务中即可，发生错误 立即回滚，但是再响应客户端的时候也有可能出现网络中断或者异常等等
 
-## 5. 优先级队列
+### 4.2 场景：消息重复消费
 
+​	消费者在消费 MQ 中的消息时，MQ 已把消息发送给消费者，消费者在给MQ 返回 ack 时网络中断， 故 MQ 未收到确认信息，该条消息会重新发给其他的消费者，或者在网络重连后再次发送给该消费者，但 实际上该消费者已成功消费了该条消息，造成消费者消费了重复的消息。
 
+### 4.3 解决思路
 
-## 6. 惰性队列
+​	MQ 消费者的幂等性的解决一般使用全局 ID 或者写个唯一标识比如时间戳 或者 UUID 或者订单消费 者消费 MQ 中的消息也可利用 MQ 的该 id 来判断，或者可按自己的规则生成一个全局唯一 id，每次消费消 息时用该 id 先判断该消息是否已消费过。
+
+#### 4.4 消费端的幂等性保障 
+
+​	在海量订单生成的业务高峰期，生产端有可能就会重复发生了消息，这时候消费端就要实现幂等性， 这就意味着我们的消息永远不会被消费多次，即使我们收到了一样的消息。业界主流的幂等性有两种操作:
+
++  ***唯一 ID+指纹码机制,利用数据库主键去重***
+
+  > 指纹码:我们的一些规则或者时间戳加别的服务给到的唯一信息码,它并不一定是我们系统生成的，基 本都是由我们的业务规则拼接而来，但是一定要保证唯一性，然后就利用查询语句进行判断这个 id 是否存 在数据库中,优势就是实现简单就一个拼接，然后查询判断是否重复；劣势就是在高并发时，如果是单个数 据库就会有写入性能瓶颈当然也可以采用分库分表提升性能，但也不是我们最推荐的方式。
+
++ ***利用 redis 的原子性去实现***
+
+  > 利用 redis 执行 setnx 命令，天然具有幂等性。从而实现不重复消费
+
+## 5. 优先级队列（默认关闭）
+
+### 5.1 使用场景
+
+​	在我们系统中有一个订单催付的场景，我们的客户在天猫下的订单,淘宝会及时将订单推送给我们，如 果在用户设定的时间内未付款那么就会给用户推送一条短信提醒，很简单的一个功能对吧，但是，tmall 商家对我们来说，肯定是要分大客户和小客户的对吧，比如像苹果，小米这样大商家一年起码能给我们创 造很大的利润，所以理应当然，他们的订单必须得到优先处理，而曾经我们的后端系统是使用 redis 来存 放的定时轮询，大家都知道 redis 只能用 List 做一个简简单单的消息队列，并不能实现一个优先级的场景， 所以订单量大了后采用 RabbitMQ 进行改造和优化,如果发现是大客户的订单给一个相对比较高的优先级， 否则就是默认优先级。
+
+​	**rabbitmq中优先级队默认是关闭的，所有需要你先开启它。**
+
+### 5.2  控制台开启并添加
+
+<img src='img\image-20221210192416580.png'>
+
+### 5.3 代码中开启
+
+```java
+//springBoot
+@Bean(BACKUP_QUEUE)
+public Queue getBackupQueue(){
+    return QueueBuilder.durable(BACKUP_QUEUE)
+        .maxPriority(10).build();//声明最大优先级同时开启
+}
+
+//java
+Map<String, Object> params = new HashMap();
+params.put("x-max-priority", 10);
+channel.queueDeclare("hello", true, false, false, params);
+```
+
+### 5.4 生产者发送消息设定优先级
+
+```java
+//springbot
+rabbitTemplate.convertAndSend(
+        "confirm.exchange",
+        routingKey,
+        msg,
+        message -> {
+            message.getMessageProperties().setPriority(5);
+            return message;
+        },
+        new CorrelationData(msg.length() + "")
+);
+//java
+AMQP.BasicProperties properties = null;
+for (int i = 1; i < 11; i++) {
+    if (i==5){//只对消息为5设置优先级
+        properties = new AMQP.BasicProperties().builder().priority(5).build();
+    }
+    channel.basicPublish(
+        NORMAL_EXCHANGE_NAME,
+        "zhangsan",
+        properties,
+        ("msg=" + i).getBytes(StandardCharsets.UTF_8)
+    );
+}
+```
+
+### 5.5 测试结果
+
+```sh
+msg=5
+msg=1
+...
+msg=4
+msg=6
+...
+msg=10
+```
+
+### 5.6注意
+
+​	要让队列实现优先级需要做的事情有如下事情:队列需要设置为优先级队列，消息需要设置消息的优先 级，消费者需要等待消息已经发送到队列中才去消费因为，这样才有机会对消息进行排序。
+
+> 因为这个是高并发时出现的，保证队列里有很多条消息，自己模拟时先不开起消费者以此确保可以右很多消息，才能看到效果。（否则来一条消息消费了一条，就没有优先级而言了）
+
+## 6. 惰性队列（默认关闭）
+
+### 6.1 使用场景
+
+​	RabbitMQ 从 3.6.0 版本开始引入了惰性队列的概念。**惰性队列会尽可能的将消息存入磁盘中**，而在消 费者消费到相应的消息时才会被加载到内存中，它的一个重要的设计目标是能够支持更长的队列，即支持 更多的消息存储。当消费者由于各种各样的原因(比如消费者下线、宕机亦或者是由于维护而关闭等)而致 使长时间内不能消费消息造成堆积时，惰性队列就很有必要了。 
+
+​	**默认情况下**，当生产者将消息发送到 RabbitMQ 的时候，**队列中的消息会尽可能的存储在内存之中**， 这样可以更加快速的将消息发送给消费者。即使是持久化的消息，在被写入磁盘的同时也会在内存中驻留 一份备份。当 RabbitMQ 需要释放内存的时候，会将内存中的消息换页至磁盘中，这个操作会耗费较长的 时间，也会阻塞队列的操作，进而无法接收新的消息。虽然 RabbitMQ 的开发者们一直在升级相关的算法， 但是效果始终不太理想，尤其是在消息量特别大的时候。
+
+### 6.2 两种模式
+
+​	队列具备两种模式：default 和 lazy。默认的为default 模式，在3.6.0 之前的版本无需做任何变更。lazy 模式即为惰性队列的模式，**可以通过调用 channel.queueDeclare 方法的时候在参数中设置**，**也可以通过 Policy 的方式设置**，如果一个队列**同时使用这两种方式设置**的话，那么 **Policy 的方式具备更高的优先级**。 如果要通过声明的方式改变已有队列的模式的话，那么只能先删除队列，然后再重新声明一个新的。
+
+### 6.3 queueDeclare 方法开启
+
+```java
+Map<String, Object> args = new HashMap<String, Object>();
+args.put("x-queue-mode", "lazy");
+channel.queueDeclare("myqueue", false, false, false, args);
+```
+
+### 6.4 plicy方式开启
+
+```sh
+rabbitmqctl set_policy Lazy "^myqueue$" '{"queue-mode":"lazy"}' --apply-to-queues
+```
+
+### 6.5 效果
+
+<img src='img\image-20221210195353850.png'>
+
+### 6.6 内存开销比（default vs lazy）
+
+<img src='img\image-20221210195519760.png'>
 
 # 第四章 集群部分*
 

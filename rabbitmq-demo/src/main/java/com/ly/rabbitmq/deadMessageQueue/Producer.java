@@ -32,11 +32,15 @@ public class Producer {
         );
 
         //2.超对队列保存消息的最大长度6[死信队列]
+        AMQP.BasicProperties properties = null;
         for (int i = 1; i < 11; i++) {
+            if (i==5){
+                properties = new AMQP.BasicProperties().builder().priority(5).build();
+            }
             channel.basicPublish(
                     NORMAL_EXCHANGE_NAME,
                     "zhangsan",
-                    null,
+                    properties,
                     ("msg=" + i).getBytes(StandardCharsets.UTF_8)
             );
         }
