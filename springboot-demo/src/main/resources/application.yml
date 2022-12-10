@@ -1,6 +1,6 @@
 spring:
   rabbitmq:
-    host: 192.168.77.3
+    host: 192.168.65.229
     username: ly
     password: 1024
     # 必须指明，否则不生效
@@ -8,3 +8,6 @@ spring:
     # correlated 异步确认
     # simple 同步确认
     publisher-confirm-type: correlated
+
+    # 开启不可路由的消息，退回给生产者
+    publisher-returns: true

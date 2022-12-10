@@ -110,7 +110,7 @@ public class MsgController {
 
         rabbitTemplate.convertAndSend(
                 "confirm.exchange",
-                "kk",
+                "k2",
                 "[sendConfirmMsg] " + msg,
                 message -> {return message;},
                 data

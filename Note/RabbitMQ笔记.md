@@ -1,3 +1,5 @@
+
+
 # 前言
 
 四大章节，带 * 的为重点章节
@@ -2246,15 +2248,262 @@ public class DelayedQueueConsumer {
 
 ## 3.  发布确认高级
 
-### 3.1 发布确认
+​	***即SpringBoot版本的发布确认***
 
-### 3.2 回退消息
+​	在生产环境中由于一些不明原因，导致 rabbitmq 重启，在 RabbitMQ 重启期间生产者消息投递失败， 导致消息丢失，需要手动处理和恢复。于是，我们开始思考，如何才能进行 RabbitMQ 的消息可靠投递呢？ 特 别是在这样比较极端的情况，RabbitMQ 集群不可用的时候，无法投递的消息该如何处理呢:
+
+> `应 用 [xxx] 在 [08-1516:36:04] 发 生 [ 错 误 日 志 异 常 ] ， alertId=[xxx] 。 由 [org.springframework.amqp.rabbit.listener.BlockingQueueConsumer:start:620] 触 发 应用 xxx 可能原因如下 服 务 名 为 ： 异 常 为 ： org.springframework.amqp.rabbit.listener.BlockingQueueConsumer:start:620, 产 生 原 因 如 下 :1.org.springframework.amqp.rabbit.listener.QueuesNotAvailableException: Cannot prepare queue for listener. Either the queue doesn't exist or the broker will not allow us to use it.||Consumer received fatal=false exception on startup:`
+
+### 3.1 ==发布确认(解决交换机出现问题)*==
+
+当交换机出现问题，怎么通知生产者？
+
+#### 3.1.1 代码架构图
+
+<img src='img\image-20221210121436587.png'>
+
+#### 3.1.2 代码-添加交换机，routingKey和队列
+
+```java
+@Configuration
+public class PublishConfirmAdvanceConfig {
+    public static final String CONFIRM_EXCHANGE = "confirm.exchange";
+    public static final String CONFIRM_QUEUE = "confirm.queue";
+    public static final String CONFIRM_ROUTING_KEY = "k1";
+	
+    //普通交换机
+    @Bean(CONFIRM_EXCHANGE)
+    public DirectExchange getExchangeInstance(){
+        return ExchangeBuilder.directExchange(CONFIRM_EXCHANGE).durable(true).build();
+    }
+	//普通队列
+    @Bean(CONFIRM_QUEUE)
+    public Queue getQueueInstance(){
+        return QueueBuilder.durable(CONFIRM_QUEUE).build();
+    }
+	//将队列和交换机绑定起来
+    @Bean(CONFIRM_ROUTING_KEY)
+    public Binding bindExchangeAndQueue(
+            @Qualifier(CONFIRM_QUEUE) Queue queue,
+            @Qualifier(CONFIRM_EXCHANGE) DirectExchange exchange){
+        return BindingBuilder.bind(queue).to(exchange).with(CONFIRM_ROUTING_KEY);
+    }
+
+}
+```
+
+#### 3.1.3 代码-生产者
+
+```java
+/**
+     * 发布确认高级 - rabbitmq服务宕机消息丢失
+     * @param msg 消息
+     * @return ok
+     */
+    @GetMapping("/sendConfirmMsg/{msg}")
+    public String sendConfirmMsg(@PathVariable String msg){
+        log.info("{} [sendConfirmMsg] 接收到生产者消息：{}",new Date(),msg);
+
+        CorrelationData data = new CorrelationData(msg.length() + "");
+
+        rabbitTemplate.convertAndSend(
+                "confirm.exchange",
+                "k2",
+                "[sendConfirmMsg] " + msg,
+                message -> {return message;},
+                data
+        );
+        return "OK";
+    }
+}
+```
+
+#### 3.1.4 代码-消费者
+
+```java
+@Slf4j
+@Component
+public class PublishConfirmAdvanceConsumer {
+
+    @RabbitListener(queues = {PublishConfirmAdvanceConfig.CONFIRM_QUEUE})
+    public void doConsume(Message message){
+        String msg = new String(message.getBody(), StandardCharsets.UTF_8);
+        log.info("{} 接收到confirm消息：{}",new Date(),msg);
+    }
+}
+```
+
+#### 3.1.5 代码-交换机回调函数（记得注入rabbitmqTemplate）*
+
+```java
+@Slf4j
+@Component
+public class MyMessagePublishCallback implements RabbitTemplate.ConfirmCallback {
+
+    //将自己写的回调函数注入到组件的属性中
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    /**
+     * 用于生产者发布消息后 回调使用（这个是针对交换机的，交换机接受到消息就返回true，不管队列有没有收到）
+     * 1.交换机（不管队列路由）正确回调函
+     *    参数 correlationData：回调消息的ID及相关属性
+     *    参数 ack：true
+     *    参数 cause： null
+     * 2.交换机（不管队列路由）失败回调函数 回调消息的ID及相关属性
+     *    参数 correlationData：
+     *    参数 ack：false
+     *    参数 cause：失败原因
+     */
+
+    @Override
+    public void confirm(CorrelationData correlationData, boolean ack, String cause) {
+        //这个是针对交换机的，交换机接受到消息就返回true，不管队列有没有收到
+        if (ack) {
+            System.out.println("消息发布成功！");
+            System.out.println(correlationData.getId());
+        } else {
+            System.out.println("消息发布失败，原因：" + cause);
+        }
+    }
+
+    //构造完再需要注入默认组件RabbitTemplate的属性，否则系统的组件rabbitTemplate不知道，无法调用
+    @PostConstruct
+    public void injectAttribute(){
+        System.out.println("构造完再更新默认组件RabbitTemplate的属性");
+        rabbitTemplate.setConfirmCallback(this);
+    }
+    
+}
+```
+
+#### 3.1.6 开启发布确认模式*
+
+必须在配置文件中开启发布确认回调函数，否则不会调用。`publisher-confirm-type: correlated`
+
+```yaml
+spring:
+  rabbitmq:
+    host: 192.168.65.229
+    username: ly
+    password: 1024
+    # 必须指明，否则不生效
+    # none 关闭发布确认模式
+    # correlated 异步确认
+    # simple 同步确认
+    publisher-confirm-type: correlated
+```
+
+#### 3.1.7 测试
+
+发送请求：`http://localhost:8080/ttl/sendConfirmMsg/张三`
+
++ 正常请求
+
+  <img src='img\image-20221210135559920.png'>
+
++ 交换机出错（解决）
+
+  <img src='img\image-20221210135828598.png'>
+
+  ***提示出错，调用了出错函数***
+
++ 路由出错（未解决）
+
+  <img src='img\image-20221210140108351.png'>
+
+  ***没有提示报错，也没有调用出错函数（消息被直接丢弃了）***
+
+### 3.2 ==回退消息(解决路由出现问题)*==
+
+​	**在仅开启了生产者确认机制的情况下，交换机接收到消息后，会直接给消息生产者发送确认消息，如 果发现该*消息不可路由，那么消息会被直接丢弃*，此时生产者是不知道消息被丢弃这个事件的。**那么如何 让无法被路由的消息帮我想办法处理一下？最起码通知我一声，我好自己处理啊。通过设置 mandatory 参 数可以在当消息传递过程中不可达目的地时将消息返回给生产者。
+
+#### 3.2.1 代码-添加交换机，routingKey和队列
+
+同 3.1.2
+
+#### 3.2.2 代码-生产者
+
+同 3.1.3
+
+#### 3.2.3 代码-消费者
+
+同 3.1.4
+
+#### 3.2.4 代码-路由回调函数（记得注入rabbitmqTemplate）*
+
+```java
+@Slf4j
+@Component
+public class MyMessagePublishCallback implements RabbitTemplate.ConfirmCallback,RabbitTemplate.ReturnCallback {
+
+    //将自己写的回调函数注入到组件的属性中
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+    
+    @Override
+    public void confirm(CorrelationData correlationData, boolean ack, String cause) {
+        。。。
+    }
+
+    //构造完再更新默认组件RabbitTemplate的属性
+    @PostConstruct
+    public void injectAttribute(){
+        //System.out.println("构造完再更新默认组件RabbitTemplate的属性");
+        rabbitTemplate.setConfirmCallback(this);
+        rabbitTemplate.setReturnCallback(this);//千万别忘记注入
+    }
+
+    /**
+     * 不可路由消息，通过回调函数回退给生产者 (成功发送给队列就不会调用该回调函数了)
+     * @param message 回退给producer的消息
+     * @param replyCode 返回代码
+     * @param replyText 返回内容
+     * @param exchange 交换机名字
+     * @param routingKey 路由key
+     */
+    @Override
+    public void returnedMessage(Message message, int replyCode, String replyText, String exchange, String routingKey) {
+        log.info("回退消息：【{}】返回代码replyCode：{},返回内容replyText：{},交换机：{},路由key:{}",
+                new String(message.getBody()),replyCode,replyText,exchange,routingKey);
+    }
+}
+```
+
+#### 3.2.5 开启发布者回调*
+
+```yaml
+spring:
+  rabbitmq:
+    host: 192.168.65.229
+    username: ly
+    password: 1024
+    # 开启交换机回调
+    publisher-confirm-type: correlated
+
+    # 开启不可路由的消息，退回给生产者
+    publisher-returns: true
+```
+
+#### 3.2.6 测试
+
+发送请求：`http://localhost:8080/ttl/sendConfirmMsg/张三`
+
+* 路由出错（完美解决）
+
+  <img src='img\image-20221210141342207.png'>
 
 ### 3.3. 备份交换机
 
+
+
 ## 4. 幂等性
 
+
+
 ## 5. 优先级队列
+
+
 
 ## 6. 惰性队列
 
