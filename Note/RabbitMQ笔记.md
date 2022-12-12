@@ -2826,7 +2826,216 @@ rabbitmqctl set_policy Lazy "^myqueue$" '{"queue-mode":"lazy"}' --apply-to-queue
 
 ## 1. Clustering
 
+### 1.1 使用集群的原因
+
+​	最开始我们介绍了如何安装及运行 RabbitMQ 服务，不过这些是单机版的，无法满足目前真实应用的 要求。如果 RabbitMQ 服务器遇到内存崩溃、机器掉电或者主板故障等情况，该怎么办？单台 RabbitMQ 服务器可以满足每秒 1000 条消息的吞吐量，那么如果应用需要 RabbitMQ 服务满足每秒 10 万条消息的吞吐量呢？购买昂贵的服务器来增强单机 RabbitMQ 务的性能显得捉襟见肘，搭建一个 RabbitMQ 集群才是 解决实际问题的关键.
+
+### 1.2 搭建步骤（VM）
+
+<img src='img\image-20221212105301220.png'>
+
++ 停止当前虚拟机，创建镜像
+
++ 克隆两份当前虚拟机镜像，并分别命名centos7、centos7（备1）、centos7（备2）
+
+  <img src='img\image-20221212102542430.png'>
+
++ 修改两个备用机器的ip
+
+  > centos7：`192.168.77.3` - `node1`
+  >
+  > centos7（备1）：`192.168.77.4` - `node2` 
+  >
+  > centos7（备2）：`192.168.77.5` - `node3`
+
++ 需改机器的名称分别为node1、node2、node3（为了能够让他们互相识别不重名）
+
+  ```sh
+  echo 'node3' > /etc/hostname 
+  reboot
+  ```
+
++ 给每台机器配置hosts，让它们能互相识别主机名
+
+  ```sh
+  echo '192.168.77.3 node1' >>/etc/hosts
+  echo '192.168.77.4 node2' >>/etc/hosts
+  echo '192.168.77.5 node3' >>/etc/hosts
+  cat /etc/hosts
+  ```
+
+  每台机器都执行者三条命令，这样机器的三台机器能互相识别
+
++ **将node1上的erlang.cookie文件拷贝到另外两台机器上，保证cookie一致性**
+
+  ```sh
+  # 只在node1节点上执行
+  scp /var/lib/rabbitmq/.erlang.cookie root@node2:/var/lib/rabbitmq/.erlang.cookie
+  scp /var/lib/rabbitmq/.erlang.cookie root@node3:/var/lib/rabbitmq/.erlang.cookie
+  ```
+
++ **启动 RabbitMQ 服务,顺带启动 Erlang 虚拟机和 RbbitMQ 应用服务(在三台节点上分别执行以 下命令)**
+
+  ```sh
+  # 代表重启 mq服务，erlang虚拟机和mq应用服务（每台机器都执行）
+  rabbitmq-server -detached
+  ```
+
++ **将node2（备机）关联到node1（主机）**
+
+  ```sh
+  # rabbitmqctl stop 会将Erlang 虚拟机关闭，rabbitmqctl stop_app 只关闭 RabbitMQ 服务
+  rabbitmqctl stop_app
+  rabbitmqctl reset
+  # 以谁为主机 后面就写节点几
+  rabbitmqctl join_cluster rabbit@node1
+  # 只启动应用服务
+  rabbitmqctl start_app
+  ```
+
+  <img src='img\image-20221212110159498.png'>
+
++ **将node3（备机）关联到node1（主机）**
+
+  ```sh
+  # rabbitmqctl stop 会将Erlang 虚拟机关闭，rabbitmqctl stop_app 只关闭 RabbitMQ 服务
+  rabbitmqctl stop_app
+  rabbitmqctl reset
+  # 以谁为主机 后面就写节点几
+  rabbitmqctl join_cluster rabbit@node1
+  # 只启动应用服务
+  rabbitmqctl start_app
+  ```
+
++ 查看集群状态
+
+  ```sh
+  # 随便哪台机器执行都可以
+  rabbitmqctl cluster_status
+  ```
+
+  > ```sh
+  > [root@node3 ~]# rabbitmqctl cluster_status
+  > Cluster status of node rabbit@node3 ...
+  > Basics
+  > 
+  > Cluster name: rabbit@node3 # 集群中当前节点名称
+  > 
+  > Disk Nodes
+  > 
+  > rabbit@node1
+  > rabbit@node2
+  > rabbit@node3
+  > 
+  > Running Nodes
+  > 
+  > rabbit@node1
+  > rabbit@node2
+  > rabbit@node3
+  > 
+  > Versions
+  > 
+  > rabbit@node1: RabbitMQ 3.8.8 on Erlang 21.3
+  > rabbit@node2: RabbitMQ 3.8.8 on Erlang 21.3
+  > rabbit@node3: RabbitMQ 3.8.8 on Erlang 21.3
+  > 
+  > Maintenance status
+  > 
+  > Node: rabbit@node1, status: not under maintenance
+  > Node: rabbit@node2, status: not under maintenance
+  > Node: rabbit@node3, status: not under maintenance
+  > 
+  > Alarms
+  > 
+  > (none)
+  > 
+  > Network Partitions
+  > 
+  > (none)
+  > 
+  > Listeners
+  > 
+  > Node: rabbit@node1, interface: [::], port: 15672, protocol: http, purpose: HTTP API
+  > Node: rabbit@node1, interface: [::], port: 25672, protocol: clustering, purpose: inter-node and CLI tool communication
+  > Node: rabbit@node1, interface: [::], port: 5672, protocol: amqp, purpose: AMQP 0-9-1 and AMQP 1.0
+  > Node: rabbit@node2, interface: [::], port: 15672, protocol: http, purpose: HTTP API
+  > Node: rabbit@node2, interface: [::], port: 25672, protocol: clustering, purpose: inter-node and CLI tool communication
+  > Node: rabbit@node2, interface: [::], port: 5672, protocol: amqp, purpose: AMQP 0-9-1 and AMQP 1.0
+  > Node: rabbit@node3, interface: [::], port: 15672, protocol: http, purpose: HTTP API
+  > Node: rabbit@node3, interface: [::], port: 25672, protocol: clustering, purpose: inter-node and CLI tool communication
+  > Node: rabbit@node3, interface: [::], port: 5672, protocol: amqp, purpose: AMQP 0-9-1 and AMQP 1.0
+  > 
+  > Feature flags
+  > 
+  > Flag: drop_unroutable_metric, state: enabled
+  > Flag: empty_basic_get_metric, state: enabled
+  > Flag: implicit_default_bindings, state: enabled
+  > Flag: maintenance_mode_status, state: enabled
+  > Flag: quorum_queue, state: enabled
+  > Flag: virtual_host_metadata, state: enabled
+  > 
+  > ```
+
++ 由于rabbitmq服务都重置了，用户肯定也没了，重新建立（**随便一台机器执行**）
+
+  ```sh
+  rabbitmqctl add_user ly 1024
+  rabbitmqctl set_user_tags ly administrator
+  rabbitmqctl set_permissions -p "/" ly ".*" ".*" ".*" 
+  
+  rabbitmqctl list_users
+  ```
+
++ web管理端查看 (任何一个ip都可以)
+
+  `http://192.168.77.4:15672/#/`
+
+  <img src='img\image-20221212111526357.png'>
+
+### 1.3 节点脱离集群
+
+​	备机节点node2或node3脱离集群命令：
+
+```sh
+#以node2为例子
+rabbitmqctl stop_app # node2上执行
+rabbitmqctl reset  # node2上执行
+rabbitmqctl start_app  # node2上执行
+rabbitmqctl cluster_status  # node2上执行
+rabbitmqctl forget_cluster_node rabbit@node2 # (node1 机器上执行，让主机忘记备机node2)
+```
+
+
+
 ## 2. 镜像队列
+
+​	**虽然现在是集群状态，但是在哪台机器上创建队列还是在那一台机器上（比如node1），其余机器节点并没有这个队列，如果node1机器挂掉了，那么其对于队列也是不可访问的。**镜像队列就是解决这个问题的。
+
+<img src='img\image-20221212112236496.png'>
+
+​	引入镜像队列(Mirror Queue)的机制，可以将队列镜像到集群中的其他 Broker 节点之上，如果集群中 的一个节点失效了，队列能自动地切换到镜像中的另一个节点上以保证服务的可用性。
+
+### 2.1 搭建步骤
+
++ 启动集群 ，且集群状态健康
+
++ 随便登陆一个机器的web管理端，指定策略
+
+  <img src='img\image-20221212114722460.png'>
+
++ 添加好的策略
+
+  <img src='img\image-20221212114838230.png'>
+
++ 新建队列或交换机
+
+  <img src='img\image-20221212115007786.png'>
+
+  <img src='img\image-20221212115128097.png'>
+
+
+
+
 
 ## 3. Haproxy + Keepalive实现高可用负载均衡
 
